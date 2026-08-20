@@ -17,7 +17,7 @@ while True :
     img[:h//2, w//2:] = cv2.rotate(smaller_frame, cv2.ROTATE_180)
     img[h//2:, w//2:] = smaller_frame
 
-
+    img = cv2.line(img, (0,0), (w,h), (255, 0, 0), 10)
     cv2.imshow('Cool_screen', img)
 
     if cv2.waitKey(1) == ord('q'):

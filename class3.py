@@ -22,6 +22,6 @@ while True :
 
     if cv2.waitKey(1) == ord('q'):
         break
-
+#first commit on mac os
 cap.release()
 cv2.destroyAllWindows()

@@ -4,27 +4,24 @@ import os
 import sys
 import numpy as np
 
-# Add parent directory to path so we can import OpenCV Zoo scripts
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../opencv_zoo/models/palm_detection_mediapipe')))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../opencv_zoo/models/handpose_estimation_mediapipe')))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
 
 try:
-    from mp_palmdet import MPPalmDet
-    from mp_handpose import MPHandPose
-except ImportError:
-    print("Error: Could not find opencv_zoo helper scripts. Double check folder paths!")
+    from src.mp_palmdet import MPPalmDet
+    from src.mp_handpose import MPHandPose
+except ImportError as e:
+    print(f"Import Error: {e}")
+    print("Make sure mp_palmdet.py and mp_handpose.py are placed in the 'src/' folder!")
     sys.exit(1)
 
-# 1. Paths to your ONNX models
-PALM_MODEL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../models/palm_detection_mediapipe_2023feb.onnx'))
-HAND_MODEL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../models/handpose_estimation_mediapipe_2023feb.onnx'))
+PALM_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'palm_detection_mediapipe_2023feb.onnx')
+HAND_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'handpose_estimation_mediapipe_2023feb.onnx')
 
-# 2. Initialize the detector and estimator models
 palm_detector = MPPalmDet(modelPath=PALM_MODEL_PATH)
 hand_estimator = MPHandPose(modelPath=HAND_MODEL_PATH)
 
-# 3. Define keyboard controls for recording gestures
-# Key '0' = fist, Key '1' = palm, Key '2' = point, Key '3' = peace
 LABEL_MAP = {
     ord('0'): 'fist',
     ord('1'): 'palm',
@@ -32,10 +29,12 @@ LABEL_MAP = {
     ord('3'): 'peace'
 }
 
-# 4. Prepare the CSV file where data will be saved
-CSV_FILE = os.path.join(os.path.dirname(__file__), 'raw_landmarks.csv')
+CONF_THRESHOLD = 0.8  
 
-# Write header row (label + 21 keypoints * 3 coordinates = 63 columns)
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+CSV_FILE = os.path.join(DATA_DIR, 'raw_landmarks.csv')
+
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -44,73 +43,121 @@ if not os.path.exists(CSV_FILE):
             header.extend([f'x_{i}', f'y_{i}', f'z_{i}'])
         writer.writerow(header)
 
-# 5. Open your webcam
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),            # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),            # index
+    (5, 9), (9, 10), (10, 11), (11, 12),       # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),     # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),    # pinky
+    (0, 17),                                   # palm edge
+]
+
+
+def parse_hand_result(hand_res):
+    """
+    MPHandPose.infer() returns a flat array of 132 values:
+      [0:4]     palm bounding box (x1, y1, x2, y2)
+      [4:67]    21 screen landmarks (x, y, z) in image pixels
+      [67:130]  21 world landmarks (x, y, z)
+      [130]     handedness
+      [131]     confidence
+    Returns (screen_landmarks (21,3), bbox (x1,y1,x2,y2), confidence) or (None, None, 0.0).
+    """
+    if hand_res is None:
+        return None, None, 0.0
+    arr = np.asarray(hand_res, dtype=np.float32).flatten()
+    if arr.size < 132:
+        return None, None, 0.0
+    bbox = arr[0:4].astype(int)
+    landmarks = arr[4:67].reshape(21, 3)
+    confidence = float(arr[131])
+    return landmarks, bbox, confidence
+
+
+def normalize(lm):
+    """
+    Make landmarks independent of hand position and size in the frame:
+    wrist (point 0) becomes the origin, and everything is scaled so the
+    farthest point from the wrist is at distance 1.
+    """
+    pts = lm[:, :2] - lm[0, :2]
+    scale = np.max(np.linalg.norm(pts, axis=1)) + 1e-6
+    xy = pts / scale
+    z = (lm[:, 2] - lm[0, 2]) / scale
+    return np.column_stack([xy, z])
+
+
+
 cap = cv2.VideoCapture(0)
 
 print("\n==========================================")
-print("     HAND DATASET COLLECTOR STARTED      ")
+print("     HAND DATASET COLLECTOR READY         ")
 print("==========================================")
-print("Hold a hand gesture in front of the camera and press:")
-print("  '0' -> Record FIST sample")
-print("  '1' -> Record PALM sample")
-print("  '2' -> Record POINT sample")
-print("  '3' -> Record PEACE sample")
-print("Press 'q' to QUIT.\n")
+print("Press '0': Fist | '1': Palm | '2': Point | '3': Peace | 'q': Quit\n")
 
 sample_counts = {'fist': 0, 'palm': 0, 'point': 0, 'peace': 0}
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
-        print("Camera error.")
+        print("Error reading camera frame.")
         break
 
-    # Flip camera so it acts like a mirror
     frame = cv2.flip(frame, 1)
-    
-    # Run Step 1: Detect palm/hand location
+
+    # Detect palms and use only the strongest one (score is the last column)
     palms = palm_detector.infer(frame)
-    
     current_landmarks = None
+    bbox = None
+    confidence = 0.0
 
-    # If a hand is found:
     if palms is not None and len(palms) > 0:
-        # Run Step 2: Estimate the 21 landmarks on that hand
-        hand = hand_estimator.infer(frame, palms[0])
-        if hand is not None:
-            # Draw the detected keypoints on screen (landmarks are in hand[0])
-            landmarks = hand[0] # Array of 21 points (x, y, z)
-            current_landmarks = landmarks
-            
-            for pt in landmarks:
-                x, y = int(pt[0]), int(pt[1])
-                cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+        best_palm = palms[np.argmax(palms[:, -1])]
+        hand_res = hand_estimator.infer(frame, best_palm)
+        landmarks, bbox, confidence = parse_hand_result(hand_res)
 
-    # Show instructions on screen
-    cv2.putText(frame, "Keys: 0:fist | 1:palm | 2:point | 3:peace | q:quit", 
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
+        if landmarks is not None and confidence >= CONF_THRESHOLD:
+            current_landmarks = landmarks
+
+            # Box around the palm
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+            # Red lines connecting the landmarks
+            for a, b in HAND_CONNECTIONS:
+                pa = (int(current_landmarks[a][0]), int(current_landmarks[a][1]))
+                pb = (int(current_landmarks[b][0]), int(current_landmarks[b][1]))
+                cv2.line(frame, pa, pb, (0, 0, 255), 2)
+
+            # Green dots on top of the lines
+            for pt in current_landmarks:
+                cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 255, 0), -1)
+
+    status_text = "0:fist | 1:palm | 2:point | 3:peace | q:quit"
+    if current_landmarks is not None:
+        cv2.putText(frame, f"[HAND DETECTED] conf={confidence:.2f}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    cv2.putText(frame, status_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
     cv2.imshow("Data Collector", frame)
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
         break
 
-    # Save data if you pressed 0, 1, 2, or 3 AND a hand is detected
     if key in LABEL_MAP and current_landmarks is not None:
         label_name = LABEL_MAP[key]
-        
-        row = [label_name]
-        for pt in current_landmarks:
-            row.extend([pt[0], pt[1], pt[2]])
+        norm = normalize(current_landmarks)  # (21, 3), position/scale invariant
 
+        row = [label_name] + [float(v) for v in norm.flatten()]
         with open(CSV_FILE, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+            csv.writer(f).writerow(row)
 
         sample_counts[label_name] += 1
-        print(f"Recorded '{label_name}' | Total counts: {sample_counts}")
+        print(f"Recorded '{label_name}' sample! Total counts: {sample_counts}")
 
 cap.release()
 cv2.destroyAllWindows()
-

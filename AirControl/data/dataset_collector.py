@@ -4,6 +4,8 @@ import os
 import sys
 import numpy as np
 
+#this is just a way of getting the path to the src folder, so we can import the modules from there 
+# ( i believe we could do like absolute path but this is more elegant)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
@@ -29,7 +31,7 @@ LABEL_MAP = {
     ord('3'): 'peace'
 }
 
-CONF_THRESHOLD = 0.8  
+CONF_THRESHOLD = 0.8 #min confidence for hand detection to be considered valid 
 
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 os.makedirs(DATA_DIR, exist_ok=True)

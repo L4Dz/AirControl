@@ -3,8 +3,10 @@ import os
 import sys
 import numpy as np
 import joblib
+import random
+import time
 
-# 1. Add base directory to sys.path
+# 1. Base Directory Setup
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
@@ -16,17 +18,17 @@ except ImportError as e:
     print(f"Import Error: {e}")
     sys.exit(1)
 
-# 2. Paths to ONNX and Trained Model
+# 2. Model Paths
 PALM_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'palm_detection_mediapipe_2023feb.onnx')
 HAND_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'handpose_estimation_mediapipe_2023feb.onnx')
 CLASSIFIER_PATH = os.path.join(BASE_DIR, 'models', 'rps_point_model.pkl')
 
-# 3. Load Models
+# 3. Load ONNX and Scikit-Learn Models
 palm_detector = MPPalmDet(modelPath=PALM_MODEL_PATH)
 hand_estimator = MPHandPose(modelPath=HAND_MODEL_PATH)
 classifier = joblib.load(CLASSIFIER_PATH)
 
-CONF_THRESHOLD = 0.7
+CONF_THRESHOLD = 0.8
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -55,14 +57,35 @@ def normalize(lm):
     z = (lm[:, 2] - lm[0, 2]) / scale
     return np.column_stack([xy, z])
 
+def get_winner(player, ai):
+    if player == ai:
+        return "DRAW"
+    winning_rules = {
+        'rock': 'scissors',
+        'scissors': 'paper',
+        'paper': 'rock'
+    }
+    if winning_rules.get(player) == ai:
+        return "PLAYER"
+    return "AI"
+
+# Game State Variables
+player_score = 0
+ai_score = 0
+current_round_state = "WAITING"  # States: WAITING, COUNTDOWN, RESULT
+countdown_start_time = 0
+COUNTDOWN_DURATION = 3 # 3 seconds
+
+user_move = None
+ai_move = None
+result_text = ""
+
 cap = cv2.VideoCapture(0)
-canvas = None
-prev_x, prev_y = 0, 0
 
 print("\n==========================================")
-print("     AIRCONTROL LIVE INFERENCE READY      ")
+print("    ROCK PAPER SCISSORS GAME READY        ")
 print("==========================================")
-print("Point: Draw | Rock: Clear Canvas | Press 'q': Quit\n")
+print("Controls: 's' = Start Round | 'r' = Reset Score | 'q' = Quit\n")
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -72,10 +95,10 @@ while cap.isOpened():
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
 
-    if canvas is None:
-        canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
+    # Process Hand Landmarks
+    detected_gesture = None
     palms = palm_detector.infer(frame)
+
     if palms is not None and len(palms) > 0:
         best_palm = palms[np.argmax(palms[:, -1])]
         hand_res = hand_estimator.infer(frame, best_palm)
@@ -91,42 +114,87 @@ while cap.isOpened():
             for pt in landmarks:
                 cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 255, 0), -1)
 
-            # Normalize landmarks
+            # Predict gesture
             norm_landmarks = normalize(landmarks)
             feature_vector = norm_landmarks.flatten().reshape(1, -1)
+            detected_gesture = classifier.predict(feature_vector)[0]
 
-            # Predict gesture class
-            prediction = classifier.predict(feature_vector)[0]
+    # game logic based on current state
+    current_time = time.time()
 
-            # Get index tip position (landmark 8)
-            index_tip = landmarks[8]
-            cx, cy = int(index_tip[0]), int(index_tip[1])
+    if current_round_state == "COUNTDOWN":
+        elapsed = current_time - countdown_start_time
+        remaining = int(np.ceil(COUNTDOWN_DURATION - elapsed))
 
-            # Handle Actions
-            if prediction == 'point':
-                cv2.circle(frame, (cx, cy), 8, (255, 0, 0), cv2.FILLED)
-                if prev_x == 0 and prev_y == 0:
-                    prev_x, prev_y = cx, cy
-                cv2.line(canvas, (prev_x, prev_y), (cx, cy), (0, 255, 0), 4)
-                prev_x, prev_y = cx, cy
+        if remaining > 0:
+            # Big Countdown Banner
+            cv2.putText(frame, f"GET READY: {remaining}", (w // 2 - 180, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 255), 4)
+        else:
+            # Time's up! Lock choices
+            if detected_gesture in ['rock', 'paper', 'scissors']:
+                user_move = detected_gesture
+                ai_move = random.choice(['rock', 'paper', 'scissors'])
+                winner = get_winner(user_move, ai_move)
 
-            elif prediction == 'paper':
-                # Rock (fist) clears/erases the entire canvas
-                canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                prev_x, prev_y = 0, 0
+                if winner == "PLAYER":
+                    player_score += 1
+                    result_text = "YOU WIN!"
+                elif winner == "AI":
+                    ai_score += 1
+                    result_text = "AI WINS!"
+                else:
+                    result_text = "IT'S A DRAW!"
 
+                current_round_state = "RESULT"
             else:
-                prev_x, prev_y = 0, 0
+                result_text = "NO VALID GESTURE DETECTED!"
+                current_round_state = "RESULT"
 
-            # Display prediction banner
-            cv2.putText(frame, f"Gesture: {prediction.upper()}", (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    # Top Scoreboard Banner
+    cv2.rectangle(frame, (0, 0), (w, 80), (30, 30, 30), cv2.FILLED)
+    cv2.putText(frame, f"PLAYER: {player_score}", (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    cv2.putText(frame, f"AI: {ai_score}", (w - 180, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-    frame = cv2.add(frame, canvas)
-    cv2.imshow("AirControl Live", frame)
+    if detected_gesture:
+        cv2.putText(frame, f"Detected: {detected_gesture.upper()}", (30, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Display Round Results
+    if current_round_state == "RESULT":
+        cv2.putText(frame, f"YOU: {user_move.upper() if user_move else 'N/A'}", (50, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.putText(frame, f"AI: {ai_move.upper() if ai_move else 'N/A'}", (w - 250, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+        # Winner Color
+        color = (0, 255, 0) if "WIN" in result_text and "AI" not in result_text else (0, 0, 255)
+        if "DRAW" in result_text:
+            color = (0, 255, 255)
+
+        cv2.putText(frame, result_text, (w // 2 - 150, h // 2 + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+        cv2.putText(frame, "Press 's' to play next round", (w // 2 - 200, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+
+    elif current_round_state == "WAITING":
+        cv2.putText(frame, "Press 's' to Start Round!", (w // 2 - 220, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+
+    cv2.imshow("AirControl - Rock Paper Scissors Game", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('s'):
+        current_round_state = "COUNTDOWN"
+        countdown_start_time = time.time()
+    elif key == ord('r'):
+        player_score = 0
+        ai_score = 0
+        current_round_state = "WAITING"
 
 cap.release()
 cv2.destroyAllWindows()

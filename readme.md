@@ -1,4 +1,4 @@
-# My First Computer Vision Journey: AirControl
+# AirControl
 
 Welcome! This repository documents my very first steps into the field of **Computer Vision**. 
 
